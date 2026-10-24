@@ -1,0 +1,6 @@
+{
+  "name": "mentor",
+  "version": "0.2.0",
+  "description": "Claude mentors, Muse implements: tools that drive one Muse session through muse-bridge, with Muse's approval requests handed back to Claude or the operator.",
+  "types": "./types/index.d.ts"
+}
