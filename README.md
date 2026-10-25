@@ -39,7 +39,7 @@ pipe and the plugin makes one-shot calls to it.
 
 ```bash
 install -m755 bridge/muse-bridge.py ~/.local/bin/muse-bridge.py   # or set MUSE_BRIDGE to its path
-claude --plugin-dir plugin                                          # or copy plugin/ to where your Claude Code loads mods
+claude plugin install mentor --marketplace sjvrensburg/claude-muse-mentor   # or a local clone's path; or claude --plugin-dir plugin
 ```
 
 Then ask Claude to call `muse_start` on a repo, and type `/mentor` for the pane. The bridge's own
@@ -55,7 +55,8 @@ CLI works without Claude: `muse-bridge.py serve -w REPO`, then `ask`, `wait`, `d
   workspace. Only you can override that, in the pane (two presses). **This is a tripwire for the
   obvious, not a sandbox.**
 - `--auto-allow` names commands Muse may run unasked (`ls,cat,git,python3`), and only for a command
-  with none of `; & | < > $ ( ) { } \`, a backslash, `~`, a newline or `../` in it. Anything else is
+  with none of `; & | < > $ ( ) { } \`, a backslash, `~`, a newline or `../` in it, and that the
+  tripwire above does not flag (with `git` listed, `git push` is still asked). Anything else is
   asked, so put real work in a script.
 - The bridge's socket is mode 600 in `$XDG_RUNTIME_DIR`: whoever can reach it can approve Muse's
   commands.
@@ -68,7 +69,7 @@ limit, what a plugin can and cannot do, and the toast that looked like a stuck c
 ## Tests
 
 ```bash
-python3 tests/test_bridge.py      # the bridge's pure parts
+python3 tests/test_bridge.py      # the bridge, against a fake `muse serve`
 claude plugin validate plugin && claude plugin test plugin
 ```
 

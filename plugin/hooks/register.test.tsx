@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 
 const PANE = {
@@ -50,5 +50,39 @@ test('a risky approval has no one-press Allow: it arms first', async ($, on) => 
   expect(await ui.find({ type: 'Button', key: 'arm-r1' })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: 'allow-r1' })).toBeFalsy()
   expect(await ui.find({ type: 'Button', key: 'deny-r1' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('with two questions only the first card has the a/d hotkeys', async ($, on) => {
+  const two = { ...SNAP, pending: [SNAP.pending[0], { ...SNAP.pending[0], id: 'a2', summary: 'touch b.txt' }] }
+  on('clock.now', () => ({ value: 0 }))
+  on('state.get', () => ({ value: { value: { shape: 'snap-1', value: two }, version: 1 } }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const first = await ui.find({ type: 'Button', key: 'deny-a1' })
+  const second = await ui.find({ type: 'Button', key: 'deny-a2' })
+  expect([first?.props.hotkey, second?.props.hotkey]).toEqual(['d', undefined])
+  await ui.unmount()
+})
+
+test('Deny sends the operator decision with `--` before the id', async ($, on) => {
+  // the pane's state in memory, so the press can drop the card
+  const held: Record<string, { value: unknown; version: number }> = { snap: { value: { shape: 'snap-1', value: SNAP }, version: 1 } }
+  on('state.get', (_: any, e: any) => ({ value: held[e.key] ?? { value: undefined, version: 0 } }))
+  on('state.set', (_: any, e: any) => {
+    held[e.key] = { value: e.value, version: (held[e.key]?.version ?? 0) + 1 }
+    return { value: { isSet: true, version: held[e.key]!.version } }
+  })
+  const argvs: string[][] = []
+  on('process.run', (_: any, e: any) => {
+    argvs.push(e.argv)
+    return { value: { exitCode: 0, stdout: '{"ok": true}', stderr: '' } }
+  })
+  on('clock.now', () => ({ value: 0 }))
+  mock.env(on, { HOME: '/home/t' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'deny-a1' })
+  await new Promise(r => setTimeout(r, 50))
+  expect(argvs[0]).toEqual(['python3', '/home/t/.local/bin/muse-bridge.py', 'decide', '-n', 'mentor',
+    '--feedback=The operator denied this.', '--by', 'operator', '--', 'a1', 'deny'])
   await ui.unmount()
 })

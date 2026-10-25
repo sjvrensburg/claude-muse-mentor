@@ -62,6 +62,19 @@ function lineOf(ev: any): Line | null {
 
 const seenApprovals = new Set<string>()
 
+// The daemon answers `status` once Muse has started a session (each of its two setup calls may take
+// up to 60 s). Gives up early if the unit has died, so a bad workspace fails in seconds.
+async function waitForBridge($: any): Promise<string | null> {
+  for (let i = 0; i < 130; i++) {
+    await $.clock.sleep(1_000)
+    const out = await bridge($, ['status'], 5_000)
+    if (out.startsWith('{')) return out
+    const unit = await $.process.run(['systemctl', '--user', 'is-active', UNIT], { timeoutMs: 5_000 })
+    if (!['active', 'activating'].includes(unit.stdout.trim())) return null
+  }
+  return null
+}
+
 // A newer refresh supersedes an older one still in flight, so a slow poll cannot repaint a card
 // the operator has just answered.
 let generation = 0
@@ -101,6 +114,10 @@ async function refreshOnce($: any, mine: number): Promise<boolean> {
   const out = await bridge($, ['snapshot'], 8_000)
   let s: any
   try { s = JSON.parse(out.split('\n')[0]) } catch { s = null }
+  if (s?.ok === false) { // the daemon is up but this snapshot failed: keep what the pane shows
+    $.ui.log(`mentor snapshot failed: ${s.error}`, { to: 'debug' })
+    return true
+  }
   if (!s || s.session === undefined) {
     if (mine !== generation) return false
     await update($, snap, () => ({ isUp: false, workspace: '', isRunning: false, pending: [], feed: [], diff: '' }))
@@ -115,6 +132,8 @@ async function refreshOnce($: any, mine: number): Promise<boolean> {
     feed: s.events.map(lineOf).filter((l: Line | null): l is Line => l !== null).slice(-30),
     diff: s.diff ?? '',
   }
+  const open = new Set(next.pending.map(p => p.id + p.summary))
+  for (const key of seenApprovals) if (!open.has(key)) seenApprovals.delete(key) // answered: forget it
   for (const p of next.pending)
     if (!seenApprovals.has(p.id + p.summary)) {
       seenApprovals.add(p.id + p.summary)
@@ -135,9 +154,9 @@ async function dropCard($: any, id: string): Promise<void> {
 
 // onPress must return at once (the engine repaints when the handler settles): drop the card now,
 // then decide and refresh in the background.
-function answer($: any, id: string, verdict: string[]): void {
+function answer($: any, id: string, verdict: 'allow' | 'deny', flags: string[]): void {
   void dropCard($, id)
-  void bridge($, ['decide', id, ...verdict]).then(() => refresh($))
+  void bridge($, ['decide', ...flags, '--', id, verdict]).then(() => refresh($))
 }
 
 const COLOR: Record<string, string> = { mentor: 'cyan', allowed: 'green', denied: 'red' }
@@ -170,21 +189,27 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__mentor__muse_start' }, async ($, e) => {
+    // the daemon runs under systemd, whose working directory is not Claude's: a relative path would miss
+    if (!String(e.workspace).startsWith('/')) return text(`workspace must be an absolute path, not ${JSON.stringify(e.workspace)}`)
     await bridge($, ['stop'], 5_000)
     await $.process.run(['systemctl', '--user', 'stop', UNIT], { timeoutMs: 10_000 }) // a lingering unit blocks the new one's name
     const auto = e.auto_allow ? ['--auto-allow', String(e.auto_allow)] : []
     const r = await $.process.run(['systemd-run', '--user', `--unit=${UNIT}`, '--collect', '-q', 'python3', await bridgePath($), 'serve', '-w', String(e.workspace), '-n', NAME, ...auto], { timeoutMs: 6_000 })
     if (r.exitCode !== 0) return text(`could not start: ${r.stderr.trim()}`)
-    await $.clock.sleep(6_000)
+    const status = await waitForBridge($)
+    if (status === null) {
+      const log = await $.process.run(['journalctl', '--user', '-u', UNIT, '-n', '15', '--no-pager', '-o', 'cat'], { timeoutMs: 5_000 })
+      return text(`the bridge did not come up. Its log:\n${log.stdout.trim() || '(empty)'}`)
+    }
     $.ui.status('muse: up')
     ensurePolling($)
-    return text(await bridge($, ['status']))
+    return text(status)
   }).catch(() => text('mentor: the tool failed (see claude --debug)'))
 
   on('tool.call', { tool: 'mcp__mentor__muse_ask' }, async ($, e) => {
     $.ui.status('muse: working')
-    const images = ((e.images as string[] | undefined) ?? []).flatMap(path => ['--image', String(path)])
-    const out = digest(await bridge($, ['ask', String(e.prompt), ...images], 600_000))
+    const images = ((e.images as string[] | undefined) ?? []).map(path => `--image=${String(path)}`)
+    const out = digest(await bridge($, ['ask', ...images, '--', String(e.prompt)], 600_000))
     $.ui.status(out.includes('APPROVAL NEEDED') ? 'muse: needs approval' : out.includes('STILL RUNNING') ? 'muse: working' : 'muse: idle')
     return text(out)
   }).catch(() => text('mentor: the tool failed (see claude --debug)'))
@@ -196,11 +221,12 @@ export const register: Register = on => {
   }).catch(() => text('mentor: the tool failed (see claude --debug)'))
 
   on('tool.call', { tool: 'mcp__mentor__muse_decide' }, async ($, e) => {
-    const fb = e.feedback ? String(e.feedback).split(/\s+/) : []
-    return text(digest(await bridge($, ['decide', String(e.id), e.allow ? 'allow' : 'deny', ...fb])))
+    // never --force or --by: a risky command needs the operator, in the pane
+    const fb = e.feedback ? [`--feedback=${String(e.feedback)}`] : []
+    return text(digest(await bridge($, ['decide', ...fb, '--', String(e.id), e.allow ? 'allow' : 'deny'])))
   }).catch(() => text('mentor: the tool failed (see claude --debug)'))
 
-  on('tool.call', { tool: 'mcp__mentor__muse_steer' }, async ($, e) => text(digest(await bridge($, ['steer', String(e.text)])))).catch(() => text('mentor: the tool failed'))
+  on('tool.call', { tool: 'mcp__mentor__muse_steer' }, async ($, e) => text(digest(await bridge($, ['steer', '--', String(e.text)])))).catch(() => text('mentor: the tool failed'))
   on('tool.call', { tool: 'mcp__mentor__muse_status' }, async $ => text(await bridge($, ['status']))).catch(() => text('mentor: the tool failed'))
   on('tool.call', { tool: 'mcp__mentor__muse_stop' }, async $ => {
     $.ui.status(undefined)
@@ -241,7 +267,7 @@ export const register: Register = on => {
         <Text bold color={s.isRunning ? 'green' : undefined}>{s.isRunning ? 'Muse is working' : 'Muse is idle'}</Text>
         <Text dimColor>{s.workspace.slice(-(width - 2))}</Text>
 
-        {s.pending.map(p => (
+        {s.pending.map((p, i) => (
           <Box key={`p-${p.id}`} flexDirection="column" borderStyle="bold" borderColor={p.isRisky ? 'red' : 'yellow'}>
             <Text bold color={p.isRisky ? 'red' : 'yellow'}>
               {p.isRisky ? '! RISKY: secrets, sudo, push or outside the repo' : '? ANSWER NEEDED'}
@@ -252,8 +278,8 @@ export const register: Register = on => {
               {!p.isRisky && (
                 <Button
                   key={`allow-${p.id}`}
-                  hotkey="a"
-                  onPress={() => answer($, p.id, ['allow', '--force', '--by', 'operator'])}
+                  hotkey={i === 0 ? 'a' : undefined} // one card per key: with two, `a` must not answer either
+                  onPress={() => answer($, p.id, 'allow', ['--force', '--by', 'operator'])}
                 >
                   <Text bold color="green">Allow</Text>
                 </Button>
@@ -272,15 +298,15 @@ export const register: Register = on => {
               {p.isRisky && armedId === p.id && (
                 <Button
                   key={`confirm-${p.id}`}
-                  onPress={() => answer($, p.id, ['allow', '--force', '--by', 'operator'])}
+                  onPress={() => answer($, p.id, 'allow', ['--force', '--by', 'operator'])}
                 >
                   <Text bold color="red">Confirm: allow this risky command</Text>
                 </Button>
               )}
               <Button
                 key={`deny-${p.id}`}
-                hotkey="d"
-                onPress={() => answer($, p.id, ['deny', 'The operator denied this.', '--by', 'operator'])}
+                hotkey={i === 0 ? 'd' : undefined}
+                onPress={() => answer($, p.id, 'deny', ['--feedback=The operator denied this.', '--by', 'operator'])}
               >
                 <Text bold color="red">Deny</Text>
               </Button>
@@ -305,7 +331,7 @@ export const register: Register = on => {
           placeholder={s.isRunning ? 'note for the running turn' : 'Muse is idle'}
           submitLabel="send"
           onSubmit={async text => {
-            if (text.trim() !== '') await bridge($, ['steer', text])
+            if (text.trim() !== '') await bridge($, ['steer', '--', text])
             await refresh($)
           }}
         />

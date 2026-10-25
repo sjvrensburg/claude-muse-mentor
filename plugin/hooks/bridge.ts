@@ -6,7 +6,9 @@ export async function bridgePath($: any): Promise<string> {
   return (await $.env.get('MUSE_BRIDGE')) ?? `${(await $.env.get('HOME')) ?? ''}/.local/bin/muse-bridge.py`
 }
 
-export async function bridge($: any, args: string[], timeoutMs = 30_000): Promise<string> {
-  const r = await $.process.run(['python3', await bridgePath($), ...args, '-n', NAME], { timeoutMs })
+// `-n NAME` goes straight after the subcommand, so a caller can end its options with `--` and pass
+// text from Claude or the operator after it without a word of it being read as a flag.
+export async function bridge($: any, [op, ...args]: string[], timeoutMs = 30_000): Promise<string> {
+  const r = await $.process.run(['python3', await bridgePath($), op, '-n', NAME, ...args], { timeoutMs })
   return r.exitCode === 0 ? r.stdout.trim() : `bridge failed (${r.exitCode}): ${(r.stderr || r.stdout).trim()}`
 }
