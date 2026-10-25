@@ -10,14 +10,14 @@ socket with one-shot commands. The Muse session outlives each client.
   muse-bridge.py ask   [-n NAME] "prompt"      # one turn; streams events as JSON lines, returns at
                                                # the first approval, the end, or --max-wait seconds
   muse-bridge.py wait  [-n NAME]               # reattach to the running turn (after decide)
-  muse-bridge.py decide [-n NAME] ID allow|deny [feedback...]
+  muse-bridge.py decide [-n NAME] [--feedback TEXT] ID allow|deny [feedback...]
   muse-bridge.py steer [-n NAME] "note"        # into the running turn
   muse-bridge.py pending|status|interrupt|stop [-n NAME]
 
 Approvals: Muse runs in `promptUnmatched` mode, so anything its own policy does not already
 allow comes here as a request. A request is auto-allowed only when it is a shell command whose
 EVERY stage's argv[0] is in `--auto-allow` and whose text has no shell metacharacters or `~`/`..`
-path escapes; everything else waits for `decide` (an `ask` client sees it as an `approval`
+path escapes and that the risky-command tripwire does not flag; everything else waits for `decide` (an `ask` client sees it as an `approval`
 event). Tested 2026-10-24 against muse 1.4.12: a Reject really blocks the command.
 """
 import argparse, base64, collections, json, mimetypes, shlex, os, re, select, shutil, socket, subprocess, sys, threading, time, uuid, queue
@@ -38,25 +38,35 @@ def uuid7():
 # `decide --force`, which only a human types. An allow covers every stage of a compound command
 # (`a && b`): it was judged as one text. Not a sandbox; a tripwire for the obvious.
 RISKY = re.compile(r"\.ssh|\.gnupg|\.config/secrets|api\.env|\.env\b|\bsudo\b|\bsu\b|rm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME)|"
-                   r"\bchmod\s+-R\b|\bdd\b|\bmkfs|curl[^|]*\|\s*(ba)?sh|systemctl|\bgit\s+push\b|--force")
+                   r"\bchmod\s+-R\b|\bdd\b|\bmkfs|curl[^|]*\|\s*(ba)?sh|systemctl|\bgit\s+push\b|--force|/dev/(tcp|udp)/")
 # A path argument outside the workspace is risky too, unless it is a system location commands
-# read from all the time.
-SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/lib", "/dev/", "/proc/self/")
+# read from all the time. Not all of /dev/: bash's /dev/tcp/HOST/PORT is a network connection.
+SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/proc/self/", "/dev/fd/", "/dev/null", "/dev/zero",
+                "/dev/random", "/dev/urandom", "/dev/stdin", "/dev/stdout", "/dev/stderr")
+# A variable that names a place outside the workspace (`$HOME/x`, `${XDG_CONFIG_HOME}`), or any
+# variable used as the root of a path (`$D/x`): the bridge cannot know where it points.
+PATH_VAR = re.compile(r"\$\{?(HOME|USER|TMPDIR|OLDPWD|XDG_\w+)\b|^\$\{?\w+\}?/")
 
 
 def leaves_workspace(cmd, workspace):
     try:
-        toks = shlex.split(cmd)
+        # punctuation_chars splits `x>/tmp/out` and `..;` the way the shell does
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
     except ValueError:
         return True  # unparseable: ask a human
     ws = os.path.realpath(workspace)
-    for t in toks:
-        if not (t.startswith(("/", "~")) or ".." in t.split("/")):
-            continue
-        path = os.path.normpath(os.path.join(ws, os.path.expanduser(t)))
-        if path == ws or path.startswith(ws + os.sep) or path.startswith(SYSTEM_PATHS):
-            continue
-        return True
+    for tok in toks:
+        if PATH_VAR.search(tok):
+            return True
+        for t in tok.split("="):  # --directory=/x, of=/x
+            if not (t.startswith(("/", "~")) or ".." in t.split("/")):
+                continue
+            path = os.path.normpath(os.path.join(ws, os.path.expanduser(t)))
+            if path == ws or path.startswith(ws + os.sep) or path.startswith(SYSTEM_PATHS):
+                continue
+            return True
     return False
 
 
@@ -79,9 +89,12 @@ def sock_path(name):
 class Bridge:
     def __init__(self, workspace, auto_allow, mode, name):
         self.workspace, self.auto_allow, self.mode, self.name = workspace, set(auto_allow), mode, name
+        # muse's stderr goes where ours does (the unit's journal): the only trace when it fails
         self.p = subprocess.Popen([MUSE, "serve", "--no-session-log"], stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                  stdout=subprocess.PIPE, text=True, bufsize=1)
         self.wlock = threading.Lock()
+        self.dlock = threading.Lock()  # one decide per approval, however many clients answer it
+        self.tlock = threading.Lock()  # one turn at a time
         self.nid = 0
         self.waiters = {}      # rpc id -> queue for the response
         self.subs = []         # queues of `ask` clients (events fan out to all)
@@ -90,9 +103,10 @@ class Bridge:
         self.denied = set()    # commands the operator denied; a retry of one is denied again unasked
         self.allow_all = set() # approvalIds whose later stages (a && b) were allowed with the first
         self.turn_id = None
+        self.starting = False  # turn/start sent, turn/started not yet seen
         self.sid = None
         self.last = {"type": "idle"}  # the last turn's final message + outcome, for `wait`
-        self.final_text = ""
+        self.final_text, self.final_is_answer = "", False
         self.log = collections.deque(maxlen=300)  # recent events with a seq, for `snapshot` (the pane)
         self.seq = 0
         self.log_lock = threading.Lock()  # emit() runs on the reader, decide threads and client handlers
@@ -101,6 +115,10 @@ class Bridge:
         self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
         r = self.rpc("session/start", {"commandId": uuid7(), "workspaceRoot": workspace, "approvalMode": mode})
         self.sid = r["session"]["sessionId"]
+
+    @property
+    def running(self):
+        return self.turn_id is not None or self.starting
 
     def send(self, o):
         with self.wlock:
@@ -112,9 +130,13 @@ class Bridge:
             self.nid += 1
             i = self.nid
         q = self.waiters[i] = queue.Queue()
-        self.send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
-        m = q.get(timeout=timeout)
-        del self.waiters[i]
+        try:
+            self.send({"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+            m = q.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(f"{method}: no answer from muse in {timeout} s") from None
+        finally:
+            self.waiters.pop(i, None)
         if "error" in m:
             raise RuntimeError(m["error"].get("message", str(m["error"])))
         return m.get("result", {})
@@ -126,18 +148,21 @@ class Bridge:
         for q in list(self.subs):
             q.put(ev)
 
-    def safe(self, subject):
+    def safe(self, a):
         """True when this approval is routine enough to allow without asking."""
+        subject = a.get("subject") or {}
         if subject.get("kind") != "shell" or not self.auto_allow:
             return False
         if re.search(r"[;&|`$<>(){}\n\\~]|\.\./", subject.get("command", "")):
             return False
+        if self.is_risky(a):  # `git push` is still a push when `git` is auto-allowed
+            return False
         stages = subject.get("stages") or []
-        return bool(stages) and all(s.get("argv", [""])[0] in self.auto_allow for s in stages)
+        return bool(stages) and all((s.get("argv") or [""])[0] in self.auto_allow for s in stages)
 
     def choose(self, a, allow):
         want = ("approved",) if allow else ("denied", "abort")
-        return next((c for c in a["availableChoices"] if c["decision"] in want), None)
+        return next((c for c in a.get("availableChoices", []) if c.get("decision") in want), None)
 
     def decide(self, a, allow, feedback=None):
         c = self.choose(a, allow)
@@ -176,91 +201,150 @@ class Bridge:
                 "summary": subj.get("command") or json.dumps(subj)[:300],
                 "workspace": subj.get("workspaceRoot"), "judgeEscalated": a.get("judgeEscalated", False),
                 "risky": self.is_risky(a),
-                "choices": [c["label"] for c in a["availableChoices"]]}
+                "choices": [c.get("label") for c in a.get("availableChoices", [])]}
 
     def reader(self):
         for line in self.p.stdout:
-            m = json.loads(line)
-            meth = m.get("method")
-            if meth == "approval/request":
-                a = m["params"]
-                self.send({"jsonrpc": "2.0", "id": m["id"], "result": {}})  # presentation receipt
-                subj = a.get("subject", {})
-                if subj.get("command") and norm(subj["command"]) in self.denied:
-                    threading.Thread(target=self.decide, args=(a, False, "The operator already denied this exact command. "
-                                     "Do not retry it or a variation; continue without it."), daemon=True).start()
-                    self.emit({"type": "auto_denied", "command": subj["command"]})
-                elif a["approvalId"] in self.allow_all:  # next stage of a command already vetted whole
-                    threading.Thread(target=self.decide, args=(a, True), daemon=True).start()
-                    self.emit({"type": "auto_allowed", "command": "(next stage) " + subj.get("command", "")})
-                elif self.safe(subj):
-                    threading.Thread(target=self.decide, args=(a, True), daemon=True).start()
-                    self.emit({"type": "auto_allowed", "command": subj.get("command")})
-                else:
-                    self.pending[a["approvalId"]] = a
-                    self.emit(self.approval_event(a))
-            elif meth == "approval/resolved":
-                self.pending.pop(m["params"].get("approvalId"), None)
-                self.emit({"type": "approval_resolved", "id": m["params"].get("approvalId"),
-                           "decision": m["params"].get("decision")})
-            elif meth == "turn/started":
-                self.turn_id = m["params"].get("turnId")
-            elif meth == "item/completed":
-                it = m["params"].get("item", {})
-                if it.get("kind") == "agentMessage":
-                    self.final_text = it.get("text", "")
-                    self.emit({"type": "message", "phase": it.get("messagePhase"), "text": it.get("text", "")})
-            elif meth == "turn/completed":
-                self.turn_id = None
-                self.last = {"type": "done", "terminal": m["params"].get("terminal"), "text": self.final_text,
-                             "error": m["params"].get("error")}
-                self.emit({"type": "done", "terminal": m["params"].get("terminal"),
-                           "error": m["params"].get("error"), "durationMs": m["params"].get("durationMs")})
-            elif "id" in m and m["id"] in self.waiters:
-                self.waiters[m["id"]].put(m)
+            try:
+                self.on_message(json.loads(line))
+            except Exception as e:  # one odd message must not stop the session from being read
+                print(f"muse-bridge: skipped a message from muse ({e!r}): {line[:300]!r}", file=sys.stderr, flush=True)
+        self.muse_exited()
+
+    def muse_exited(self):
+        """Muse is gone: wake anyone waiting, then end the daemon so `status` stops reporting a session."""
+        code = self.p.wait()
+        print(f"muse-bridge: muse serve exited ({code})", file=sys.stderr, flush=True)
+        for q in list(self.waiters.values()):  # a call muse will never answer
+            q.put({"error": {"message": f"muse serve exited ({code})"}})
+        self.emit({"type": "done", "terminal": "museExited", "error": f"muse serve exited ({code})"})
+        time.sleep(0.5)  # let the handlers deliver it
+        try:
+            os.unlink(sock_path(self.name))
+        except OSError:
+            pass
+        os._exit(1)
+
+    def on_message(self, m):
+        meth = m.get("method")
+        if meth == "approval/request":
+            a = m["params"]
+            self.send({"jsonrpc": "2.0", "id": m["id"], "result": {}})  # presentation receipt
+            subj = a.get("subject", {})
+            if subj.get("command") and norm(subj["command"]) in self.denied:
+                threading.Thread(target=self.decide, args=(a, False, "The operator already denied this exact command. "
+                                 "Do not retry it or a variation; continue without it."), daemon=True).start()
+                self.emit({"type": "auto_denied", "command": subj["command"]})
+            elif a["approvalId"] in self.allow_all:  # next stage of a command already vetted whole
+                threading.Thread(target=self.decide, args=(a, True), daemon=True).start()
+                self.emit({"type": "auto_allowed", "command": "(next stage) " + subj.get("command", "")})
+            elif self.safe(a):
+                threading.Thread(target=self.decide, args=(a, True), daemon=True).start()
+                self.emit({"type": "auto_allowed", "command": subj.get("command")})
+            else:
+                self.pending[a["approvalId"]] = a
+                self.emit(self.approval_event(a))
+        elif meth == "approval/resolved":
+            self.pending.pop(m["params"].get("approvalId"), None)
+            self.emit({"type": "approval_resolved", "id": m["params"].get("approvalId"),
+                       "decision": m["params"].get("decision")})
+        elif meth == "turn/started":
+            self.turn_id, self.starting = m["params"].get("turnId"), False
+        elif meth == "item/completed":
+            it = m["params"].get("item", {})
+            if it.get("kind") == "agentMessage":
+                # the turn's answer is its finalAnswer message; any later note must not replace it
+                phase = it.get("messagePhase")
+                if phase == "finalAnswer" or not self.final_is_answer:
+                    self.final_text, self.final_is_answer = it.get("text", ""), phase == "finalAnswer"
+                self.emit({"type": "message", "phase": phase, "text": it.get("text", "")})
+        elif meth == "turn/completed":
+            self.turn_id, self.starting = None, False
+            self.last = {"type": "done", "terminal": m["params"].get("terminal"), "text": self.final_text,
+                         "error": m["params"].get("error")}
+            self.emit({"type": "done", "terminal": m["params"].get("terminal"),
+                       "error": m["params"].get("error"), "durationMs": m["params"].get("durationMs")})
+        elif meth is not None and "id" in m:  # a request this bridge does not know: say so, or muse waits on it
+            print(f"muse-bridge: refused unsupported request {meth!r}", file=sys.stderr, flush=True)
+            self.send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": f"muse_bridge does not support {meth}"}})
+        elif meth is None and m.get("id") in self.waiters:
+            self.waiters[m["id"]].put(m)
+
+    @staticmethod
+    def client_gone(conn):
+        r, _, _ = select.select([conn], [], [], 0)
+        try:
+            return bool(r) and conn.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
 
     # ---- client ops
     def handle(self, conn, req):
         op = req.get("op")
         out = lambda o: conn.sendall((json.dumps(o) + "\n").encode())
         if op in ("ask", "wait"):
+            # The stream ends (the connection closes) at the first approval or at the end of the turn.
+            if op == "ask":
+                parts = [{"type": "text", "text": req["text"]}]
+                for path in req.get("images", []):  # MSP carries images inline; other files go by path in the text
+                    mt = mimetypes.guess_type(path)[0] or ""
+                    if not mt.startswith("image/"):
+                        return out({"ok": False, "error": f"{path}: not an image; give non-images by path in the prompt"})
+                    with open(path, "rb") as f:
+                        parts.append({"type": "image", "mediaType": mt, "base64Data": base64.b64encode(f.read()).decode()})
+                with self.tlock:
+                    if self.running:
+                        return out({"ok": False, "error": "Muse is already running a turn: wait for it, steer it or interrupt it"})
+                    self.starting = True
             q = queue.Queue()
-            self.subs.append(q)
+            self.subs.append(q)  # before looking at turn_id, so a turn that ends now still reaches this client
             try:
                 if op == "ask":
-                    self.final_text = ""
+                    self.final_text, self.final_is_answer = "", False
                     self.emit({"type": "prompt", "text": req["text"]})
-                    parts = [{"type": "text", "text": req["text"]}]
-                    for path in req.get("images", []):  # MSP carries images inline; other files go by path in the text
-                        mt = mimetypes.guess_type(path)[0] or ""
-                        if not mt.startswith("image/"):
-                            return out({"ok": False, "error": f"{path}: not an image; give non-images by path in the prompt"})
-                        with open(path, "rb") as f:
-                            parts.append({"type": "image", "mediaType": mt, "base64Data": base64.b64encode(f.read()).decode()})
-                    self.rpc("turn/start", {"commandId": uuid7(), "sessionId": self.sid, "input": parts})
-                elif self.turn_id is None:
+                    try:
+                        self.rpc("turn/start", {"commandId": uuid7(), "sessionId": self.sid, "input": parts})
+                    except Exception:
+                        self.starting = False
+                        raise
+                elif not self.running:
                     return out(self.last)  # nothing running: the last outcome
-                for a in list(self.pending.values()):  # a waiter must not miss a request already open
+                waiting = list(self.pending.values())  # a waiter must not miss a request already open
+                for a in waiting:
                     out(self.approval_event(a))
+                if waiting:
+                    return
                 while True:
-                    ev = q.get()
+                    try:
+                        ev = q.get(timeout=5)
+                    except queue.Empty:
+                        if self.client_gone(conn):  # it gave up (--max-wait): stop holding a thread for it
+                            return
+                        continue
                     out(ev)
-                    if ev["type"] == "done":
-                        break
+                    if ev["type"] in ("approval", "done"):
+                        return
             finally:
                 self.subs.remove(q)
         elif op == "decide":
-            a = self.pending.get(req["id"])
-            if not a:
-                return out({"ok": False, "error": "no such pending approval"})
-            cmd = (a.get("subject") or {}).get("command", "")
-            if req["allow"] and not req.get("force") and self.is_risky(a):
-                return out({"ok": False, "needsHuman": True,
-                            "error": f"not allowed without a human: {cmd or a.get('subject', {}).get('kind')!r}; "
-                                     "ask the operator to run: muse-bridge.py decide --force"})
+            with self.dlock:  # the pane and Claude may answer the same request at once: the first one wins
+                a = self.pending.get(req["id"])
+                if not a:
+                    return out({"ok": False, "error": "no such pending approval"})
+                cmd = (a.get("subject") or {}).get("command", "")
+                if req["allow"] and not req.get("force") and self.is_risky(a):
+                    return out({"ok": False, "needsHuman": True,
+                                "error": f"not allowed without a human: {cmd or a.get('subject', {}).get('kind')!r}; "
+                                         "ask the operator to answer it in the /mentor pane"})
+                del self.pending[req["id"]]
             if req["allow"] and req.get("all", True):
                 self.allow_all.add(req["id"])  # the tripwire above judged the whole command text
-            self.decide(a, req["allow"], req.get("feedback"))
+            try:
+                self.decide(a, req["allow"], req.get("feedback"))
+            except Exception:
+                self.allow_all.discard(req["id"])
+                self.pending[req["id"]] = a  # still open: let someone answer it again
+                raise
             if not req["allow"] and req.get("by") == "operator":
                 self.denied.add(norm(cmd))
             self.emit({"type": "decided", "id": req["id"], "allow": req["allow"], "by": req.get("by", "client"),
@@ -278,14 +362,14 @@ class Bridge:
         elif op == "pending":
             out({"pending": [{"id": k, "summary": (v.get("subject") or {}).get("command"),
                               "workspace": (v.get("subject") or {}).get("workspaceRoot")}
-                             for k, v in self.pending.items()]})
+                             for k, v in list(self.pending.items())]})
         elif op == "snapshot":
-            out({"diff": self.repo_state(), "session": self.sid, "workspace": self.workspace, "running": self.turn_id is not None,
+            out({"diff": self.repo_state(), "session": self.sid, "workspace": self.workspace, "running": self.running,
                  "seq": self.seq, "events": list(self.log)[-int(req.get("n", 40)):],
-                 "pending": [{"id": k, **self.approval_event(v)} for k, v in self.pending.items()]})
+                 "pending": [{"id": k, **self.approval_event(v)} for k, v in list(self.pending.items())]})
         elif op == "status":
             out({"session": self.sid, "workspace": self.workspace, "mode": self.mode,
-                 "running": self.turn_id is not None, "pending": len(self.pending),
+                 "running": self.running, "pending": len(self.pending),
                  "autoAllow": sorted(self.auto_allow)})
         elif op == "stop":
             out({"ok": True})
@@ -340,26 +424,30 @@ def call(name, req):
     except OSError:
         sys.exit(f"muse-bridge '{name}' is not running (start: muse-bridge.py serve -w REPO -n {name})")
     s.sendall((json.dumps(req) + "\n").encode())
-    stop_early = req.get("op") in ("ask", "wait")
-    end = time.time() + req.get("maxWait", 540)
+    # The daemon closes the connection when it has answered (for ask/wait: at the first approval or
+    # the end of the turn). The deadline is checked on every pass, so a chatty turn cannot outlast it.
+    waits = req.get("op") in ("ask", "wait")
+    limit = req.get("maxWait", 540) if waits else 90
+    end = time.time() + limit
     s.settimeout(1)
     buf = b""
-    while True:
+    while time.time() < end:
         try:
             chunk = s.recv(65536)
-            if not chunk:
-                return
-            buf += chunk
         except socket.timeout:
-            if stop_early and time.time() > end:
-                print(json.dumps({"type": "still_running"}), flush=True)  # turn goes on; `wait` reattaches
-                return
             continue
+        if not chunk:
+            if buf.strip():
+                print(buf.decode(), flush=True)
+            return
+        buf += chunk
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             print(line.decode(), flush=True)
-            if stop_early and json.loads(line).get("type") in ("approval", "done", "idle"):
-                return
+    if waits:
+        print(json.dumps({"type": "still_running"}), flush=True)  # turn goes on; `wait` reattaches
+    else:
+        sys.exit(json.dumps({"ok": False, "error": f"no answer from the bridge in {limit} s"}))
 
 
 def main():
@@ -377,6 +465,9 @@ def main():
             x.add_argument("id")
             x.add_argument("verdict", choices=["allow", "deny"])
             x.add_argument("feedback", nargs="*")
+            # One argument, so a client passing on someone else's text (the plugin, for Claude) cannot have
+            # a word of it read as --force or --by: it sends --feedback=TEXT and puts `--` before ID.
+            x.add_argument("--feedback", dest="feedback_text", help="feedback as one argument")
             x.add_argument("--force", action="store_true", help="human override of the risky-command tripwire")
             x.add_argument("--by", default="client", help="who decided, for the event log")
     for k, x in sub.choices.items():
@@ -389,7 +480,8 @@ def main():
     if a.cmd == "serve":
         serve(a)
     elif a.cmd == "decide":
-        call(a.name, {"op": "decide", "id": a.id, "allow": a.verdict == "allow", "force": a.force, "by": a.by, "feedback": " ".join(a.feedback) or None})
+        call(a.name, {"op": "decide", "id": a.id, "allow": a.verdict == "allow", "force": a.force, "by": a.by,
+                      "feedback": a.feedback_text or " ".join(a.feedback) or None})
     elif a.cmd == "ask":
         call(a.name, {"op": "ask", "text": a.text, "maxWait": a.max_wait,
                       "images": [os.path.abspath(i) for i in a.image]})

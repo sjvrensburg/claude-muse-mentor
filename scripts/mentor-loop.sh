@@ -56,11 +56,15 @@ mentor() { # $1 = prompt, $2 = "first" on the first call
 }
 
 # Operator steering: anything appended to $LOG/steer.md is added to the next prompt, then cleared.
+# The file is moved aside before it is read, so a line typed meanwhile lands in a new steer.md for
+# the next prompt instead of being truncated away.
 steer() {
   [[ -s $LOG/steer.md ]] || return 0
+  mv "$LOG/steer.md" "$LOG/steer.taken"
   printf '\n\nThe operator interjects (follow this over the earlier plan where they conflict):\n%s\n' \
-    "$(<"$LOG/steer.md")"
-  : >"$LOG/steer.md"
+    "$(<"$LOG/steer.taken")"
+  cat "$LOG/steer.taken" >>"$LOG/steer.log"
+  rm -f "$LOG/steer.taken"
 }
 
 muse_run() { # stdout is the answer; muse's own notices go to stderr
@@ -82,7 +86,12 @@ $TICKET"
 
 for ((r = 1; r <= ROUNDS; r++)); do
   echo ">> round $r/$ROUNDS: muse implements"
-  REPORT=$(muse_run "$PROMPT$(steer)")
+  REPORT=$(muse_run "$PROMPT$(steer)") || {
+    rc=$?  # set -e would end the loop here without a word
+    echo ">> muse exec failed (exit $rc); its stderr ($LOG/muse.stderr) ends:" >&2
+    tail -n 20 "$LOG/muse.stderr" >&2
+    exit 1
+  }
   printf '%s\n' "$REPORT" >"$LOG/muse-$r.md"
 
   echo ">> round $r/$ROUNDS: mentor reviews"

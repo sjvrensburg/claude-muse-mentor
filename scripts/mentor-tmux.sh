@@ -23,7 +23,7 @@ q() { printf '%q ' "$@"; }  # quote each arg for the shell tmux starts
 
 tmux new-session -d -s mentor -x 200 -y 50 \
   "$(q "$HERE/mentor-loop.sh" -l "$LOG" "$@"); echo; echo '>> loop finished (exit '\$?'); press Enter to close'; read"
-tmux split-window -h -t mentor "watch -n2 -t $(q "git -C $REPO status -sb; echo; git -C $REPO diff --stat HEAD")"
+tmux split-window -h -t mentor "watch -n2 -t $(q "$(q git -C "$REPO" status -sb); echo; $(q git -C "$REPO" diff --stat HEAD)")"
 tmux split-window -v -t mentor \
   "echo 'steer> type a note and press Enter; the next agent prompt carries it'; while IFS= read -r -p 'steer> ' l; do printf '%s\n' \"\$l\" >> $(q "$LOG/steer.md"); done"
 echo ">> logs $LOG"
