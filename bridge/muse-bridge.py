@@ -40,15 +40,20 @@ def uuid7():
 RISKY = re.compile(r"\.ssh|\.gnupg|\.config/secrets|api\.env|\.env\b|\bsudo\b|\bsu\b|rm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME)|"
                    r"\bchmod\s+-R\b|\bdd\b|\bmkfs|curl[^|]*\|\s*(ba)?sh|systemctl|\bgit\s+push\b|--force|/dev/(tcp|udp)/")
 # A path argument outside the workspace is risky too, unless it is a system location commands
-# read from all the time. Not all of /dev/: bash's /dev/tcp/HOST/PORT is a network connection.
-SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/proc/self/", "/dev/fd/", "/dev/null", "/dev/zero",
-                "/dev/random", "/dev/urandom", "/dev/stdin", "/dev/stdout", "/dev/stderr")
+# read from all the time. Not all of /dev/: bash's /dev/tcp/HOST/PORT is a network connection. Not
+# all of /proc/self/ either: /proc/self/root/ is the whole filesystem and /proc/self/environ the secrets.
+SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/", "/proc/self/fd/", "/proc/self/status", "/dev/fd/",
+                "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/stdin", "/dev/stdout", "/dev/stderr")
 # A variable that names a place outside the workspace (`$HOME/x`, `${XDG_CONFIG_HOME}`), or any
 # variable used as the root of a path (`$D/x`): the bridge cannot know where it points.
 PATH_VAR = re.compile(r"\$\{?(HOME|USER|TMPDIR|OLDPWD|XDG_\w+)\b|^\$\{?\w+\}?/")
+# Brace expansion builds a path the bridge never sees as text: `{.,.}.` is `..`.
+BRACES = re.compile(r"\{[^{}]*(,|\.\.)[^{}]*\}")
 
 
 def leaves_workspace(cmd, workspace):
+    if "$'" in cmd:  # ANSI-C quoting: $'\x2e\x2e/x' is ../x, spelled so no check below sees it
+        return True
     try:
         # punctuation_chars splits `x>/tmp/out` and `..;` the way the shell does
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
@@ -57,10 +62,16 @@ def leaves_workspace(cmd, workspace):
     except ValueError:
         return True  # unparseable: ask a human
     ws = os.path.realpath(workspace)
-    for tok in toks:
-        if PATH_VAR.search(tok):
+    for i, tok in enumerate(toks):
+        if BRACES.search(tok):
             return True
-        for t in tok.split("="):  # --directory=/x, of=/x
+        if tok in ("cd", "pushd"):  # `cd`, `cd -`, `cd -P`: to $HOME, $OLDPWD or somewhere not named
+            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+            if not nxt or nxt.startswith("-") or set(nxt) <= set("();<>|&"):
+                return True
+        for t in tok.split("="):  # --directory=/x, of=/x, --directory=$D/x
+            if PATH_VAR.search(t):
+                return True
             if not (t.startswith(("/", "~")) or ".." in t.split("/")):
                 continue
             path = os.path.normpath(os.path.join(ws, os.path.expanduser(t)))
@@ -173,7 +184,15 @@ class Bridge:
         if feedback and c.get("acceptsFeedback"):
             p["feedback"] = feedback
         self.rpc("approval/decide", p)
-        self.pending.pop(a["approvalId"], None)  # now, not at approval/resolved: `wait` must not re-announce it
+
+    def auto_decide(self, a, allow, feedback=None):
+        """An answer the bridge gives unasked. If it fails, a human must answer instead, or Muse waits forever."""
+        try:
+            self.decide(a, allow, feedback)
+        except Exception as e:
+            print(f"muse-bridge: could not answer {a.get('approvalId')!r} unasked ({e!r}); asking", file=sys.stderr, flush=True)
+            self.pending[a["approvalId"]] = a
+            self.emit(self.approval_event(a))
 
     def repo_state(self):
         """`git status -sb` + diff stat of the workspace, here so the pane polls with one process.
@@ -196,7 +215,7 @@ class Bridge:
         return subj.get("kind") != "shell" or bool(RISKY.search(cmd)) or leaves_workspace(cmd, self.workspace)
 
     def approval_event(self, a):
-        subj = a.get("subject", {})
+        subj = a.get("subject") or {}
         return {"type": "approval", "id": a["approvalId"], "kind": subj.get("kind"),
                 "summary": subj.get("command") or json.dumps(subj)[:300],
                 "workspace": subj.get("workspaceRoot"), "judgeEscalated": a.get("judgeEscalated", False),
@@ -230,16 +249,16 @@ class Bridge:
         if meth == "approval/request":
             a = m["params"]
             self.send({"jsonrpc": "2.0", "id": m["id"], "result": {}})  # presentation receipt
-            subj = a.get("subject", {})
+            subj = a.get("subject") or {}
             if subj.get("command") and norm(subj["command"]) in self.denied:
-                threading.Thread(target=self.decide, args=(a, False, "The operator already denied this exact command. "
+                threading.Thread(target=self.auto_decide, args=(a, False, "The operator already denied this exact command. "
                                  "Do not retry it or a variation; continue without it."), daemon=True).start()
                 self.emit({"type": "auto_denied", "command": subj["command"]})
             elif a["approvalId"] in self.allow_all:  # next stage of a command already vetted whole
-                threading.Thread(target=self.decide, args=(a, True), daemon=True).start()
+                threading.Thread(target=self.auto_decide, args=(a, True), daemon=True).start()
                 self.emit({"type": "auto_allowed", "command": "(next stage) " + subj.get("command", "")})
             elif self.safe(a):
-                threading.Thread(target=self.decide, args=(a, True), daemon=True).start()
+                threading.Thread(target=self.auto_decide, args=(a, True), daemon=True).start()
                 self.emit({"type": "auto_allowed", "command": subj.get("command")})
             else:
                 self.pending[a["approvalId"]] = a
@@ -260,6 +279,10 @@ class Bridge:
                 self.emit({"type": "message", "phase": phase, "text": it.get("text", "")})
         elif meth == "turn/completed":
             self.turn_id, self.starting = None, False
+            # an approval belongs to its turn: one still open now can never be answered, and left in
+            # `pending` it would end every later ask/wait at once
+            self.pending.clear()
+            self.allow_all.clear()
             self.last = {"type": "done", "terminal": m["params"].get("terminal"), "text": self.final_text,
                          "error": m["params"].get("error")}
             self.emit({"type": "done", "terminal": m["params"].get("terminal"),
