@@ -39,7 +39,7 @@ pipe and the plugin makes one-shot calls to it.
 
 ```bash
 install -m755 bridge/muse-bridge.py ~/.local/bin/muse-bridge.py   # or set MUSE_BRIDGE to its path
-claude --plugin-dir plugin                                          # or copy plugin/ to where your Claude Code loads mods
+claude plugin install mentor --marketplace sjvrensburg/claude-muse-mentor   # or a local clone's path; or claude --plugin-dir plugin
 ```
 
 Then ask Claude to call `muse_start` on a repo, and type `/mentor` for the pane. The bridge's own
