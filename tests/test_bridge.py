@@ -53,8 +53,10 @@ for line in sys.stdin:
     m = json.loads(line); meth = m.get("method"); p = m.get("params", {})
     if meth in (None, "initialized"): continue
     res = {"session": {"sessionId": "s1"}} if meth == "session/start" else {}
+    if meth == "skill/list":
+        res = {"skills": [{"selector": "tdd", "description": "x" * 500, "displayName": "TDD", "source": "user"}]}
     if meth == "turn/start":
-        text = p["input"][0]["text"]
+        text = next((x["text"] for x in p["input"] if x["type"] == "text"), "")
         if text == "exit": sys.exit(3)
         say({"jsonrpc": "2.0", "id": m["id"], "result": res})
         say({"jsonrpc": "2.0", "method": "turn/started", "params": {"turnId": "t1"}})
@@ -153,9 +155,76 @@ b.pending.clear()
 snap = op(b, {"op": "snapshot"})[0]
 assert snap["session"] == "s1" and snap["running"] is False, snap
 
+# a skill goes to Muse as its own input part, before the text
+skills = op(b, {"op": "skills"})[0]["skills"]
+assert skills[0]["selector"] == "tdd" and len(skills[0]["description"]) <= 200, skills
+op(b, {"op": "ask", "text": "ls", "skill": "tdd", "skillArgs": "--strict"})
+starts = [a for a in answers() if a.get("method") == "turn/start"]
+assert starts[-1]["params"]["input"][:2] == [{"type": "skill", "selector": "tdd", "arguments": "--strict"},
+                                            {"type": "text", "text": "ls"}], starts[-1]
+op(b, {"op": "decide", "id": "A-ls", "allow": False})
+op(b, {"op": "wait"})
+
+# interrupt with nothing running says so instead of sending Muse a stray turn/interrupt
+assert op(b, {"op": "interrupt"})[0] == {"ok": False, "error": "no running turn"}
+
+# a command Muse's shell backgrounds (300 s) is reported once, and named again when the turn ends
+seen = []
+q = __import__("queue").Queue()
+b.subs.append(q)
+bg_item = {"kind": "toolCall", "itemId": "i1", "background": True, "backgroundInitiator": "timeout",
+           "args": json.dumps({"command": "make test"})}
+b.on_message({"method": "item/updated", "params": {"item": bg_item}})
+b.on_message({"method": "item/completed", "params": {"item": bg_item}})
+b.on_message({"method": "item/completed", "params": {"item": {"kind": "backgroundTerminalCompletion", "backgroundTerminalCompletion":
+              {"command": "make test", "terminalStatus": "completed", "output": "42 passed", "outputTruncated": False, "toolCallId": "c"}}}})
+b.on_message({"method": "turn/completed", "params": {"terminal": "completed"}})
+b.subs.remove(q)
+while not q.empty():
+    seen.append(q.get())
+kinds = [e["type"] for e in seen]
+assert kinds == ["backgrounded", "background_finished", "done"], kinds
+assert seen[0]["command"] == "make test" and seen[0]["initiator"] == "timeout", seen[0]
+assert seen[2]["backgrounded"] == ["make test"] and b.last["backgrounded"] == ["make test"], seen[2]
+assert not b.backgrounded  # the next turn starts clean
+assert mb.background_command({"args": "not json", "displayLabel": {"active": "Running x"}}) == "Running x"
+
 # Muse exiting wakes waiters
 b.send({"jsonrpc": "2.0", "id": 99, "method": "turn/start", "params": {"input": [{"type": "text", "text": "exit"}]}})
 assert TestBridge.exited.wait(5)
+
+# ---------------------------------------------------------------- the sandbox
+
+real_which, mb.shutil.which = mb.shutil.which, lambda name: "/usr/bin/" + name
+env = {"HOME": "/home/u", "XDG_RUNTIME_DIR": "/run/user/1000"}
+have = {"/home", "/tmp", "/run/user", "/run/user/1000", "/home/u", "/home/u/.config/muse", "/home/u/.local/share/muse",
+        "/home/u/.config/muse/settings.json", "/home/u/.gitconfig", "/home/u/.local/bin"}
+argv = mb.sandbox_argv("/tmp/w", "/home/u/.local/bin/muse", env, have.__contains__)
+pairs = list(zip(argv, argv[1:]))
+for hidden in ("/home", "/tmp", "/run/user/1000", "/home/u"):  # the bridge socket, ssh-agent, the home directory
+    assert ("--tmpfs", hidden) in pairs, hidden
+assert "/mnt" not in argv  # a path that does not exist is not mounted over (bwrap would fail)
+assert argv[argv.index("/home/u/.config/muse") - 1] == "--bind"
+assert argv[argv.index("/home/u/.config/muse/settings.json") - 1] == "--ro-bind"  # Muse cannot loosen its policy
+assert argv[argv.index("/home/u/.local/bin") - 1] == "--ro-bind"
+assert argv[-5:] == ["--bind", "/tmp/w", "/tmp/w", "--chdir", "/tmp/w"]  # last, so a hidden /tmp does not cover it
+for bad in ("/", "/home", "/home/u"):  # a workspace holding the home directory leaves nothing to hide
+    try:
+        mb.sandbox_argv(bad, "/usr/bin/muse", env, have.__contains__)
+        raise AssertionError(bad)
+    except RuntimeError:
+        pass
+mb.shutil.which = real_which
+if real_which("bwrap"):  # the real thing: home and the runtime dir are empty, the workspace writable
+    import subprocess
+    sbx_ws = tempfile.mkdtemp(dir=os.path.expanduser("~"))
+    try:
+        r = subprocess.run(mb.sandbox_argv(sbx_ws, "/usr/bin/true") + ["sh", "-c",
+                           f'ls -A "{os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")}" | wc -l; touch /usr/x 2>/dev/null || echo ro; echo w > f && cat f'],
+                           capture_output=True, text=True, timeout=20)
+        assert r.stdout.split() == ["0", "ro", "w"], (r.stdout, r.stderr)
+    finally:
+        __import__("shutil").rmtree(sbx_ws)
 
 # ---------------------------------------------------------------- the client's deadline
 
