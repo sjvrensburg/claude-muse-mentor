@@ -11,6 +11,7 @@ const PANE = {
 const SNAP = {
   isUp: true,
   workspace: '/work/repo',
+  isSandboxed: true,
   isRunning: true,
   pending: [{ id: 'a1', summary: 'rm -rf build', kind: 'shell', isJudgeUnsure: false, isRisky: false }],
   feed: [
@@ -28,7 +29,7 @@ test('with no session the pane says so', async ($, on) => {
 })
 
 test('a pending approval shows its command and Allow/Deny', async ($, on) => {
-  on('state.get', () => ({ value: { value: { shape: 'snap-1', value: SNAP }, version: 1 } }))
+  on('state.get', () => ({ value: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }))
   on('clock.now', () => ({ value: 0 }))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const seen = {
@@ -44,7 +45,7 @@ test('a pending approval shows its command and Allow/Deny', async ($, on) => {
 test('a risky approval has no one-press Allow: it arms first', async ($, on) => {
   const risky = { ...SNAP, pending: [{ id: 'r1', summary: 'cat ~/.ssh/config', kind: 'shell', isJudgeUnsure: false, isRisky: true }] }
   on('clock.now', () => ({ value: 0 }))
-  on('state.get', () => ({ value: { value: { shape: 'snap-1', value: risky }, version: 1 } }))
+  on('state.get', () => ({ value: { value: { shape: 'snap-2', value: risky }, version: 1 } }))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /RISKY/ })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: 'arm-r1' })).toBeTruthy()
@@ -56,7 +57,7 @@ test('a risky approval has no one-press Allow: it arms first', async ($, on) => 
 test('with two questions only the first card has the a/d hotkeys', async ($, on) => {
   const two = { ...SNAP, pending: [SNAP.pending[0], { ...SNAP.pending[0], id: 'a2', summary: 'touch b.txt' }] }
   on('clock.now', () => ({ value: 0 }))
-  on('state.get', () => ({ value: { value: { shape: 'snap-1', value: two }, version: 1 } }))
+  on('state.get', () => ({ value: { value: { shape: 'snap-2', value: two }, version: 1 } }))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const first = await ui.find({ type: 'Button', key: 'deny-a1' })
   const second = await ui.find({ type: 'Button', key: 'deny-a2' })
@@ -66,7 +67,7 @@ test('with two questions only the first card has the a/d hotkeys', async ($, on)
 
 test('Deny sends the operator decision with `--` before the id', async ($, on) => {
   // the pane's state in memory, so the press can drop the card
-  const held: Record<string, { value: unknown; version: number }> = { snap: { value: { shape: 'snap-1', value: SNAP }, version: 1 } }
+  const held: Record<string, { value: unknown; version: number }> = { snap: { value: { shape: 'snap-2', value: SNAP }, version: 1 } }
   on('state.get', (_: any, e: any) => ({ value: held[e.key] ?? { value: undefined, version: 0 } }))
   on('state.set', (_: any, e: any) => {
     held[e.key] = { value: e.value, version: (held[e.key]?.version ?? 0) + 1 }
@@ -84,5 +85,13 @@ test('Deny sends the operator decision with `--` before the id', async ($, on) =
   await new Promise(r => setTimeout(r, 50))
   expect(argvs[0]).toEqual(['python3', '/home/t/.local/bin/muse-bridge.py', 'decide', '-n', 'mentor',
     '--feedback=The operator denied this.', '--by', 'operator', '--', 'a1', 'deny'])
+  await ui.unmount()
+})
+
+test('the pane says when Muse is not sandboxed', async ($, on) => {
+  on('clock.now', () => ({ value: 0 }))
+  on('state.get', () => ({ value: { value: { shape: 'snap-2', value: { ...SNAP, isSandboxed: false } }, version: 1 } }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /NOT sandboxed/ })).toBeTruthy()
   await ui.unmount()
 })

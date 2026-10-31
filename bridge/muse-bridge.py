@@ -6,13 +6,18 @@ MSP needs a live two-way pipe (approval requests come in, `approval/decide` goes
 daemon owns that pipe; the plugin, a tmux pane or a human at a shell talk to it through a unix
 socket with one-shot commands. The Muse session outlives each client.
 
-  muse-bridge.py serve -w REPO [-n NAME] [--auto-allow git,ls,...]   # daemon, keep running
-  muse-bridge.py ask   [-n NAME] "prompt"      # one turn; streams events as JSON lines, returns at
-                                               # the first approval, the end, or --max-wait seconds
+  muse-bridge.py serve -w REPO [-n NAME] [--auto-allow git,ls,...] [--sandbox]   # daemon, keep running
+  muse-bridge.py ask   [-n NAME] [--skill SEL [--skill-args TEXT]] "prompt"   # one turn; streams events
+                                               # as JSON lines, returns at the first approval, the end,
+                                               # or --max-wait seconds
   muse-bridge.py wait  [-n NAME]               # reattach to the running turn (after decide)
   muse-bridge.py decide [-n NAME] [--feedback TEXT] ID allow|deny [feedback...]
   muse-bridge.py steer [-n NAME] "note"        # into the running turn
-  muse-bridge.py pending|status|interrupt|stop [-n NAME]
+  muse-bridge.py pending|status|skills|interrupt|stop [-n NAME]
+
+--sandbox runs `muse serve` under bubblewrap: the filesystem is read-only, /home, /tmp, /run/user
+(this socket, ssh-agent, ...) and removable media are hidden, and only the workspace and Muse's own
+state directories are writable. The network stays open: Muse needs it to reach its model.
 
 Approvals: Muse runs in `promptUnmatched` mode, so anything its own policy does not already
 allow comes here as a request. A request is auto-allowed only when it is a shell command whose
@@ -95,13 +100,70 @@ def sock_path(name):
     return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"muse-bridge-{name}.sock")
 
 
+def sandbox_argv(workspace, muse, env=os.environ, exists=os.path.exists):
+    """The bubblewrap prefix that runs `muse` with only the workspace and Muse's own state writable.
+    What it hides it replaces with an empty tmpfs; later binds put back the few paths Muse needs."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise RuntimeError("--sandbox needs bubblewrap (bwrap) on PATH")
+    home = os.path.realpath(env.get("HOME") or os.path.expanduser("~"))
+    ws = os.path.realpath(workspace)
+    if ws == "/" or home == ws or home.startswith(ws + os.sep):
+        raise RuntimeError(f"--sandbox: the workspace {ws} contains the home directory, so there is nothing to hide")
+    xdg = lambda var, default: os.path.realpath(env.get(var) or os.path.join(home, default))
+    hide = ["/home", "/tmp", "/var/tmp", "/run/user", "/mnt", "/media", "/run/media", home,
+            env.get("XDG_RUNTIME_DIR") or ""]
+    rw = [os.path.join(xdg("XDG_CONFIG_HOME", ".config"), "muse"), os.path.join(xdg("XDG_DATA_HOME", ".local/share"), "muse"),
+          os.path.join(xdg("XDG_STATE_HOME", ".local/state"), "muse"), os.path.join(xdg("XDG_CACHE_HOME", ".cache"), "muse")]
+    ro = [os.path.join(home, ".gitconfig"), os.path.join(xdg("XDG_CONFIG_HOME", ".config"), "git")]
+    muse_dir = os.path.dirname(os.path.realpath(muse))
+    if muse_dir == home or muse_dir.startswith(home + os.sep):
+        ro.append(muse_dir)  # ~/.local/bin: muse itself, and tools installed beside it
+    argv = [bwrap, "--die-with-parent", "--unshare-pid", "--unshare-ipc", "--ro-bind", "/", "/",
+            "--dev", "/dev", "--proc", "/proc"]
+    seen = set()
+    for d in hide:
+        d = os.path.realpath(d) if d else ""
+        if d and d not in seen and exists(d):
+            seen.add(d)
+            argv += ["--tmpfs", d]
+    for d in ro:
+        if exists(d):
+            argv += ["--ro-bind", d, d]
+    for d in rw:
+        if exists(d):
+            argv += ["--bind", d, d]
+    # Muse's policy files stay read-only on top of its writable config (auth.json must refresh), so
+    # it cannot loosen its own approval rules. A mount point cannot be replaced or deleted either.
+    for f in ("settings.json", "trust.json"):
+        f = os.path.join(rw[0], f)
+        if exists(f):
+            argv += ["--ro-bind", f, f]
+    return argv + ["--bind", ws, ws, "--chdir", ws]  # last: the workspace may sit under a hidden path
+
+
+def background_command(item):
+    """The shell command of a backgrounded `toolCall` item, as well as the item names it."""
+    try:
+        args = json.loads(item.get("args") or "{}")
+    except ValueError:
+        args = {}
+    if isinstance(args, dict):
+        for k in ("command", "cmd"):
+            if isinstance(args.get(k), str):
+                return args[k]
+    return (item.get("displayLabel") or {}).get("active") or item.get("tool") or "(a command)"
+
+
 # ---------------------------------------------------------------- daemon
 
 class Bridge:
-    def __init__(self, workspace, auto_allow, mode, name):
+    def __init__(self, workspace, auto_allow, mode, name, sandbox=False):
         self.workspace, self.auto_allow, self.mode, self.name = workspace, set(auto_allow), mode, name
+        self.sandbox = sandbox
+        prefix = sandbox_argv(workspace, MUSE) if sandbox else []
         # muse's stderr goes where ours does (the unit's journal): the only trace when it fails
-        self.p = subprocess.Popen([MUSE, "serve", "--no-session-log"], stdin=subprocess.PIPE,
+        self.p = subprocess.Popen([*prefix, MUSE, "serve", "--no-session-log"], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True, bufsize=1)
         self.wlock = threading.Lock()
         self.dlock = threading.Lock()  # one decide per approval, however many clients answer it
@@ -118,6 +180,7 @@ class Bridge:
         self.sid = None
         self.last = {"type": "idle"}  # the last turn's final message + outcome, for `wait`
         self.final_text, self.final_is_answer = "", False
+        self.backgrounded = {}  # itemId -> command Muse's shell moved to the background this turn
         self.log = collections.deque(maxlen=300)  # recent events with a seq, for `snapshot` (the pane)
         self.seq = 0
         self.log_lock = threading.Lock()  # emit() runs on the reader, decide threads and client handlers
@@ -269,6 +332,18 @@ class Bridge:
                        "decision": m["params"].get("decision")})
         elif meth == "turn/started":
             self.turn_id, self.starting = m["params"].get("turnId"), False
+        elif meth in ("item/updated", "item/completed") and (m["params"].get("item") or {}).get("background"):
+            # Muse's shell gives a foreground command 300 s, then backgrounds it and may end the turn
+            # without a word: say so, or the mentor reads the silence as success
+            it = m["params"]["item"]
+            if it.get("itemId") not in self.backgrounded:
+                cmd = background_command(it)
+                self.backgrounded[it.get("itemId")] = cmd
+                self.emit({"type": "backgrounded", "command": cmd, "initiator": it.get("backgroundInitiator")})
+        elif meth == "item/completed" and (m["params"].get("item") or {}).get("kind") == "backgroundTerminalCompletion":
+            f = m["params"]["item"].get("backgroundTerminalCompletion") or {}
+            self.emit({"type": "background_finished", "command": f.get("command", ""), "status": f.get("terminalStatus"),
+                       "output": (f.get("output") or "")[-2000:]})
         elif meth == "item/completed":
             it = m["params"].get("item", {})
             if it.get("kind") == "agentMessage":
@@ -283,10 +358,11 @@ class Bridge:
             # `pending` it would end every later ask/wait at once
             self.pending.clear()
             self.allow_all.clear()
+            bg, self.backgrounded = list(self.backgrounded.values()), {}
             self.last = {"type": "done", "terminal": m["params"].get("terminal"), "text": self.final_text,
-                         "error": m["params"].get("error")}
-            self.emit({"type": "done", "terminal": m["params"].get("terminal"),
-                       "error": m["params"].get("error"), "durationMs": m["params"].get("durationMs")})
+                         "error": m["params"].get("error"), "backgrounded": bg}
+            self.emit({"type": "done", "terminal": m["params"].get("terminal"), "error": m["params"].get("error"),
+                       "durationMs": m["params"].get("durationMs"), "backgrounded": bg})
         elif meth is not None and "id" in m:  # a request this bridge does not know: say so, or muse waits on it
             print(f"muse-bridge: refused unsupported request {meth!r}", file=sys.stderr, flush=True)
             self.send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": f"muse_bridge does not support {meth}"}})
@@ -308,7 +384,12 @@ class Bridge:
         if op in ("ask", "wait"):
             # The stream ends (the connection closes) at the first approval or at the end of the turn.
             if op == "ask":
-                parts = [{"type": "text", "text": req["text"]}]
+                parts = []
+                if req.get("skill"):  # a Muse skill, resolved by Muse against its catalog (`skills` lists it)
+                    parts.append({"type": "skill", "selector": req["skill"],
+                                  **({"arguments": req["skillArgs"]} if req.get("skillArgs") else {})})
+                if req["text"] or not parts:
+                    parts.append({"type": "text", "text": req["text"]})
                 for path in req.get("images", []):  # MSP carries images inline; other files go by path in the text
                     mt = mimetypes.guess_type(path)[0] or ""
                     if not mt.startswith("image/"):
@@ -324,7 +405,8 @@ class Bridge:
             try:
                 if op == "ask":
                     self.final_text, self.final_is_answer = "", False
-                    self.emit({"type": "prompt", "text": req["text"]})
+                    shown = (f"/{req['skill']} {req.get('skillArgs') or ''}".strip() + "\n" if req.get("skill") else "") + req["text"]
+                    self.emit({"type": "prompt", "text": shown.strip()})
                     try:
                         self.rpc("turn/start", {"commandId": uuid7(), "sessionId": self.sid, "input": parts})
                     except Exception:
@@ -380,20 +462,30 @@ class Bridge:
                                     "input": [{"type": "text", "text": req["text"]}]})
             out({"ok": True})
         elif op == "interrupt":
+            if not self.running:
+                return out({"ok": False, "error": "no running turn"})
             self.rpc("turn/interrupt", {"commandId": uuid7(), "sessionId": self.sid})
+            self.emit({"type": "interrupted", "by": req.get("by", "client")})
             out({"ok": True})
+        elif op == "skills":
+            r = self.rpc("skill/list", {"sessionId": self.sid})
+            short = lambda t: t if len(t) <= 200 else t[:197] + "..."
+            out({"skills": [{"selector": s.get("selector"), "description": short(s.get("description") or ""),
+                             **({"argumentHint": s["argumentHint"]} if s.get("argumentHint") else {})}
+                            for s in r.get("skills", [])]})
         elif op == "pending":
             out({"pending": [{"id": k, "summary": (v.get("subject") or {}).get("command"),
                               "workspace": (v.get("subject") or {}).get("workspaceRoot")}
                              for k, v in list(self.pending.items())]})
         elif op == "snapshot":
             out({"diff": self.repo_state(), "session": self.sid, "workspace": self.workspace, "running": self.running,
+                 "sandbox": self.sandbox,
                  "seq": self.seq, "events": list(self.log)[-int(req.get("n", 40)):],
                  "pending": [{"id": k, **self.approval_event(v)} for k, v in list(self.pending.items())]})
         elif op == "status":
             out({"session": self.sid, "workspace": self.workspace, "mode": self.mode,
                  "running": self.running, "pending": len(self.pending),
-                 "autoAllow": sorted(self.auto_allow)})
+                 "autoAllow": sorted(self.auto_allow), "sandbox": self.sandbox})
         elif op == "stop":
             out({"ok": True})
             try:
@@ -413,12 +505,14 @@ def serve(args):
             sys.exit(f"muse-bridge '{args.name}' already running at {path}")
         except OSError:
             os.unlink(path)  # stale socket from a dead daemon
-    b = Bridge(os.path.abspath(args.workspace), [x for x in args.auto_allow.split(",") if x], args.mode, args.name)
+    b = Bridge(os.path.abspath(args.workspace), [x for x in args.auto_allow.split(",") if x], args.mode, args.name,
+               args.sandbox)
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(path)
     os.chmod(path, 0o600)  # whoever can reach this socket can approve Muse's commands
     srv.listen(8)
-    print(f">> muse-bridge '{args.name}': session {b.sid}, workspace {b.workspace}, socket {path}", flush=True)
+    print(f">> muse-bridge '{args.name}': session {b.sid}, workspace {b.workspace}, socket {path}"
+          f"{', sandboxed' if b.sandbox else ''}", flush=True)
 
     def client(conn):
         try:
@@ -480,7 +574,8 @@ def main():
     sp.add_argument("-w", "--workspace", required=True)
     sp.add_argument("--auto-allow", default="", help="comma list of argv[0] allowed without asking")
     sp.add_argument("--mode", default="promptUnmatched", choices=["promptUnmatched", "onRequest", "denyUnmatched"])
-    for c in ("ask", "wait", "decide", "steer", "pending", "status", "snapshot", "interrupt", "stop"):
+    sp.add_argument("--sandbox", action="store_true", help="run muse under bubblewrap: only the workspace is writable, home is hidden")
+    for c in ("ask", "wait", "decide", "steer", "pending", "status", "skills", "snapshot", "interrupt", "stop"):
         x = sub.add_parser(c)
         if c in ("ask", "steer"):
             x.add_argument("text")
@@ -497,6 +592,10 @@ def main():
         x.add_argument("-n", "--name", default="default")
         if k == "ask":
             x.add_argument("--image", action="append", default=[], help="attach an image file (repeatable)")
+            x.add_argument("--skill", help="invoke this Muse skill (a selector from `skills`)")
+            x.add_argument("--skill-args", help="free-text arguments for --skill, as one argument")
+        if k == "interrupt":
+            x.add_argument("--by", default="client", help="who interrupted, for the event log")
         if k in ("ask", "wait"):
             x.add_argument("--max-wait", type=int, default=540, help="seconds before returning with still_running")
     a = ap.parse_args()
@@ -506,12 +605,14 @@ def main():
         call(a.name, {"op": "decide", "id": a.id, "allow": a.verdict == "allow", "force": a.force, "by": a.by,
                       "feedback": a.feedback_text or " ".join(a.feedback) or None})
     elif a.cmd == "ask":
-        call(a.name, {"op": "ask", "text": a.text, "maxWait": a.max_wait,
+        call(a.name, {"op": "ask", "text": a.text, "maxWait": a.max_wait, "skill": a.skill, "skillArgs": a.skill_args,
                       "images": [os.path.abspath(i) for i in a.image]})
     elif a.cmd == "steer":
         call(a.name, {"op": "steer", "text": a.text})
     elif a.cmd == "wait":
         call(a.name, {"op": "wait", "maxWait": a.max_wait})
+    elif a.cmd == "interrupt":
+        call(a.name, {"op": "interrupt", "by": a.by})
     else:
         call(a.name, {"op": a.cmd})
 

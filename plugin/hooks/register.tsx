@@ -12,7 +12,9 @@ const UNIT = 'muse-bridge-mentor'
 const ROLE =
   'You are the MENTOR; Muse is the implementer. Never edit files yourself for this task: ' +
   'plan, hand Muse a concrete ticket with an acceptance check, then review its work yourself ' +
-  '(git diff, Read) and send precise feedback to the SAME Muse session until you approve. '
+  '(git diff, Read) and send precise feedback to the SAME Muse session until you approve. ' +
+  'Load the mentor:mentoring skill for the full playbook. Muse\'s shell moves any command that runs past 300 s ' +
+  'to the background and may end the turn silently: split long builds and test runs into short steps. '
 
 const text = (s: string) => ({ result: s })
 
@@ -29,11 +31,23 @@ function digest(out: string): string {
           'Then call muse_decide, then muse_wait. One allow covers every part of a compound command.',
       )
     else if (ev.type === 'message') lines.push(`MUSE SAYS (${ev.phase}): ${ev.text}`)
-    else if (ev.type === 'done') lines.push(`${ev.text ? `MUSE SAID: ${ev.text}\n` : ''}TURN ${ev.terminal}${ev.error ? ': ' + JSON.stringify(ev.error) : ''} (${ev.durationMs ?? '?'} ms)`)
+    else if (ev.type === 'done') {
+      lines.push(`${ev.text ? `MUSE SAID: ${ev.text}\n` : ''}TURN ${ev.terminal}${ev.error ? ': ' + JSON.stringify(ev.error) : ''} (${ev.durationMs ?? '?'} ms)`)
+      if (ev.backgrounded?.length)
+        lines.push(`WARNING: this turn moved ${ev.backgrounded.map((c: string) => `\`${c}\``).join(', ')} to the background, so the turn's ` +
+          'end does not mean that work finished or passed. Check its result yourself, and have Muse rerun it in shorter steps.')
+    }
+    else if (ev.type === 'backgrounded')
+      lines.push(`BACKGROUNDED (${ev.initiator ?? '?'}): Muse's shell moved \`${ev.command}\` to the background${ev.initiator === 'timeout' ? ' after 300 s' : ''}.`)
+    else if (ev.type === 'background_finished')
+      lines.push(`BACKGROUND DONE (${ev.status}): \`${ev.command}\`${ev.output ? `\n${ev.output}` : ''}`)
+    else if (ev.type === 'interrupted') lines.push(`(interrupt sent by ${ev.by})`)
     else if (ev.type === 'still_running') lines.push('STILL RUNNING: call muse_wait to keep waiting.')
     else if (ev.type === 'auto_allowed') lines.push(`(auto-allowed: ${ev.command})`)
     else if (ev.type === 'auto_denied') lines.push(`(refused a retry of a command the operator denied: ${ev.command})`)
     else if (ev.type === 'idle') lines.push('Muse is idle; nothing is running.')
+    else if (Array.isArray(ev.skills))
+      lines.push(ev.skills.length ? ev.skills.map((k: any) => `- ${k.selector}${k.argumentHint ? ` ${k.argumentHint}` : ''}: ${k.description}`).join('\n') : 'Muse has no skills.')
     else if (ev.ok === false) lines.push(`ERROR: ${ev.error}`)
     else if (!['approval_resolved', 'prompt', 'decided'].includes(ev.type)) lines.push(raw) // pane-only events
   }
@@ -42,7 +56,7 @@ function digest(out: string): string {
 
 const PANE = 'mentor'
 // Change the tag when Snap's fields change: it declines what an earlier version stored.
-const snap = atom({ plugin: 'mentor', key: 'snap' } as const, null, { shape: 'snap-1' })
+const snap = atom({ plugin: 'mentor', key: 'snap' } as const, null, { shape: 'snap-2' })
 // The id of the risky card whose first Allow press is waiting for its confirming second one.
 const armed = atom({ plugin: 'mentor', key: 'armed' } as const, '', { shape: 'armed-1' })
 
@@ -55,7 +69,10 @@ function lineOf(ev: any): Line | null {
     case 'auto_allowed': return { ...at, kind: 'auto', text: ev.command }
     case 'auto_denied': return { ...at, kind: 'denied', text: `retry refused (operator denied it): ${ev.command}` }
     case 'decided': return { ...at, kind: ev.allow ? 'allowed' : 'denied', text: `${ev.by}: ${ev.command ?? ''}` }
-    case 'done': return { ...at, kind: 'done', text: `${ev.terminal} in ${Math.round((ev.durationMs ?? 0) / 1000)} s` }
+    case 'done': return { ...at, kind: 'done', text: `${ev.terminal} in ${Math.round((ev.durationMs ?? 0) / 1000)} s${ev.backgrounded?.length ? ` (${ev.backgrounded.length} backgrounded)` : ''}` }
+    case 'backgrounded': return { ...at, kind: 'background', text: `moved to background (${ev.initiator ?? '?'}): ${ev.command}` }
+    case 'background_finished': return { ...at, kind: 'background', text: `background ${ev.status}: ${ev.command}` }
+    case 'interrupted': return { ...at, kind: 'denied', text: `interrupted by ${ev.by}` }
     default: return null
   }
 }
@@ -120,13 +137,14 @@ async function refreshOnce($: any, mine: number): Promise<boolean> {
   }
   if (!s || s.session === undefined) {
     if (mine !== generation) return false
-    await update($, snap, () => ({ isUp: false, workspace: '', isRunning: false, pending: [], feed: [], diff: '' }))
+    await update($, snap, () => ({ isUp: false, workspace: '', isSandboxed: false, isRunning: false, pending: [], feed: [], diff: '' }))
     return false
   }
   if (mine !== generation) return true
   const next: Snap = {
     isUp: true,
     workspace: s.workspace,
+    isSandboxed: s.sandbox === true,
     isRunning: s.running,
     pending: s.pending.map((p: any) => ({ id: p.id, summary: p.summary, kind: p.kind, isJudgeUnsure: p.judgeEscalated, isRisky: p.risky })),
     feed: s.events.map(lineOf).filter((l: Line | null): l is Line => l !== null).slice(-30),
@@ -159,10 +177,10 @@ function answer($: any, id: string, verdict: 'allow' | 'deny', flags: string[]):
   void bridge($, ['decide', ...flags, '--', id, verdict]).then(() => refresh($))
 }
 
-const COLOR: Record<string, string> = { mentor: 'cyan', allowed: 'green', denied: 'red' }
+const COLOR: Record<string, string> = { mentor: 'cyan', allowed: 'green', denied: 'red', background: 'yellow' }
 
 const GLYPH: Record<string, string> = {
-  mentor: 'CLAUDE', muse: 'MUSE', 'muse-note': 'muse', auto: 'auto-ok', allowed: 'ALLOW', denied: 'DENY', done: 'done',
+  mentor: 'CLAUDE', muse: 'MUSE', 'muse-note': 'muse', auto: 'auto-ok', allowed: 'ALLOW', denied: 'DENY', done: 'done', background: 'BG',
 }
 
 export const register: Register = on => {
@@ -171,16 +189,22 @@ export const register: Register = on => {
       $.tool.register({ name, description, isDeferred: false, inputSchema: { type: 'object', properties, required } })
     await spec('muse_start', ROLE + 'Start (or restart) the Muse session on a repo. Call once before muse_ask.',
       { workspace: { type: 'string', description: 'absolute repo path' },
-        auto_allow: { type: 'string', description: 'comma list of read-only/routine commands Muse may run unasked, e.g. "ls,cat,git,python3,pytest"' } },
+        auto_allow: { type: 'string', description: 'comma list of read-only/routine commands Muse may run unasked, e.g. "ls,cat,git,python3,pytest"' },
+        sandbox: { type: 'boolean', description: 'run Muse under bubblewrap so it can write only the repo and cannot see the home directory (default true). Pass false only when the operator asks for it.' } },
       ['workspace'])
     await spec('muse_ask', 'Send Muse a task or feedback in its ONE ongoing session; returns at the first approval request, when Muse finishes, or after ~9 min. ' +
-        'Attach images with `images` (absolute paths, sent inline). Any other file (PDF, text, audio): put its absolute path in the prompt; Muse reads it itself.',
-      { prompt: { type: 'string' }, images: { type: 'array', items: { type: 'string' }, description: 'absolute paths of image files to attach' } }, ['prompt'])
+        'Attach images with `images` (absolute paths, sent inline). Any other file (PDF, text, audio): put its absolute path in the prompt; Muse reads it itself. ' +
+        'To have Muse run one of its own skills, name it in `skill` (a selector from muse_skills).',
+      { prompt: { type: 'string' }, images: { type: 'array', items: { type: 'string' }, description: 'absolute paths of image files to attach' },
+        skill: { type: 'string', description: 'a Muse skill selector from muse_skills, invoked before the prompt' },
+        skill_args: { type: 'string', description: 'free-text arguments for the skill' } }, ['prompt'])
     await spec('muse_wait', 'Keep waiting on Muse after a muse_decide or a STILL RUNNING result.', {})
     await spec('muse_decide', "Answer one of Muse's approval requests. Dangerous ones (secrets, sudo, push, outside the repo) are refused here and need the operator.",
       { id: { type: 'string' }, allow: { type: 'boolean' }, feedback: { type: 'string', description: 'on deny: guidance Muse receives' } },
       ['id', 'allow'])
     await spec('muse_steer', 'Add a note to the turn Muse is running now, without waiting for it to finish.', { text: { type: 'string' } }, ['text'])
+    await spec('muse_interrupt', 'Stop the turn Muse is running now (it is going the wrong way, or stuck); the session stays. Returns how the turn ended. Then send feedback with muse_ask.', {})
+    await spec('muse_skills', "List Muse's own skills (selectors for muse_ask's `skill`).", {})
     await spec('muse_status', 'Is the Muse session up, running, or waiting on approvals?', {})
     await spec('muse_stop', 'End the Muse session and stop the daemon.', {})
     await $.command.register({ name: 'mentor', description: 'Open the mentor pane: Muse session, approvals, steer' })
@@ -194,7 +218,8 @@ export const register: Register = on => {
     await bridge($, ['stop'], 5_000)
     await $.process.run(['systemctl', '--user', 'stop', UNIT], { timeoutMs: 10_000 }) // a lingering unit blocks the new one's name
     const auto = e.auto_allow ? ['--auto-allow', String(e.auto_allow)] : []
-    const r = await $.process.run(['systemd-run', '--user', `--unit=${UNIT}`, '--collect', '-q', 'python3', await bridgePath($), 'serve', '-w', String(e.workspace), '-n', NAME, ...auto], { timeoutMs: 6_000 })
+    const sandbox = e.sandbox === false ? [] : ['--sandbox']
+    const r = await $.process.run(['systemd-run', '--user', `--unit=${UNIT}`, '--collect', '-q', 'python3', await bridgePath($), 'serve', '-w', String(e.workspace), '-n', NAME, ...auto, ...sandbox], { timeoutMs: 6_000 })
     if (r.exitCode !== 0) return text(`could not start: ${r.stderr.trim()}`)
     const status = await waitForBridge($)
     if (status === null) {
@@ -209,7 +234,9 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__mentor__muse_ask' }, async ($, e) => {
     $.ui.status('muse: working')
     const images = ((e.images as string[] | undefined) ?? []).map(path => `--image=${String(path)}`)
-    const out = digest(await bridge($, ['ask', ...images, '--', String(e.prompt)], 600_000))
+    // one argument each, so a selector or its arguments cannot be read as a flag
+    const skill = e.skill ? [`--skill=${String(e.skill)}`, ...(e.skill_args ? [`--skill-args=${String(e.skill_args)}`] : [])] : []
+    const out = digest(await bridge($, ['ask', ...images, ...skill, '--', String(e.prompt)], 600_000))
     $.ui.status(out.includes('APPROVAL NEEDED') ? 'muse: needs approval' : out.includes('STILL RUNNING') ? 'muse: working' : 'muse: idle')
     return text(out)
   }).catch(() => text('mentor: the tool failed (see claude --debug)'))
@@ -227,6 +254,15 @@ export const register: Register = on => {
   }).catch(() => text('mentor: the tool failed (see claude --debug)'))
 
   on('tool.call', { tool: 'mcp__mentor__muse_steer' }, async ($, e) => text(digest(await bridge($, ['steer', '--', String(e.text)])))).catch(() => text('mentor: the tool failed'))
+  on('tool.call', { tool: 'mcp__mentor__muse_interrupt' }, async $ => {
+    const sent = await bridge($, ['interrupt'])
+    if (!sent.includes('"ok": true')) return text(digest(sent)) // nothing running, or the bridge is down
+    // the interrupt is only admitted; the turn is over at its `done` (terminal cancelled)
+    const out = digest(await bridge($, ['wait', '--max-wait', '60'], 90_000))
+    $.ui.status(out.includes('STILL RUNNING') ? 'muse: working' : 'muse: idle')
+    return text(out)
+  }).catch(() => text('mentor: the tool failed (see claude --debug)'))
+  on('tool.call', { tool: 'mcp__mentor__muse_skills' }, async $ => text(digest(await bridge($, ['skills'])))).catch(() => text('mentor: the tool failed'))
   on('tool.call', { tool: 'mcp__mentor__muse_status' }, async $ => text(await bridge($, ['status']))).catch(() => text('mentor: the tool failed'))
   on('tool.call', { tool: 'mcp__mentor__muse_stop' }, async $ => {
     $.ui.status(undefined)
@@ -266,6 +302,9 @@ export const register: Register = on => {
         {s.pending.length > 0 && <Text bold color="yellow">{s.pending.length} question(s) waiting for you</Text>}
         <Text bold color={s.isRunning ? 'green' : undefined}>{s.isRunning ? 'Muse is working' : 'Muse is idle'}</Text>
         <Text dimColor>{s.workspace.slice(-(width - 2))}</Text>
+        {s.isSandboxed
+          ? <Text dimColor>sandboxed: Muse can write only this repo; home is hidden</Text>
+          : <Text color="yellow">NOT sandboxed: Muse can read everything you can</Text>}
 
         {s.pending.map((p, i) => (
           <Box key={`p-${p.id}`} flexDirection="column" borderStyle="bold" borderColor={p.isRisky ? 'red' : 'yellow'}>
@@ -336,7 +375,7 @@ export const register: Register = on => {
           }}
         />
         <Box>
-          <Button key="interrupt" label="Interrupt" hotkey="i" onPress={async () => { await bridge($, ['interrupt']); await refresh($) }} />
+          <Button key="interrupt" label="Interrupt" hotkey="i" onPress={async () => { await bridge($, ['interrupt', '--by', 'operator']); await refresh($) }} />
           <Button key="stop" label="Stop session" hotkey="s" onPress={async () => { await bridge($, ['stop']); await refresh($) }} />
         </Box>
       </Box>

@@ -18,6 +18,8 @@ Claude Code (mentor)  ──muse_* tools──▶  muse-bridge.py  ──▶  mu
 - Claude Code (tested on 2.1.310).
 - Muse Code CLI, logged in (tested on 1.4.12).
 - Python 3 and `git`. The repository Muse works in must be a git repo.
+- [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) for the sandbox, which is on by
+  default. Unprivileged user namespaces must be allowed (they are on Fedora and most distributions).
 
 ## Install
 
@@ -38,7 +40,8 @@ Restart any open Claude Code sessions afterwards. To keep the bridge somewhere e
    > Use Muse to add a `--json` flag to the CLI in /home/me/src/mytool. Start it with auto_allow
    > `ls,cat,git`.
 
-   Claude calls `muse_start`, writes Muse a ticket with an acceptance check, and waits.
+   Claude loads the `mentor:mentoring` skill, calls `muse_start`, writes Muse a ticket with an
+   acceptance check, and waits.
 2. Type `/mentor` to open the pane beside the chat (it needs a terminal about 110 columns wide).
 3. Watch the activity feed. Claude answers routine approvals itself; anything it may not allow
    shows up as a card in the pane for you. Claude reviews Muse's diff and keeps sending feedback
@@ -46,16 +49,18 @@ Restart any open Claude Code sessions afterwards. To keep the bridge somewhere e
 4. When you're done, ask Claude to stop Muse, or press **Stop session** in the pane.
 
 You can attach screenshots to a task (Claude passes them to Muse as images); for any other file,
-give its path in the task and Muse reads it itself.
+give its path in the task and Muse reads it itself. Claude can also have Muse run one of its own
+skills (`muse_skills` lists them), and interrupt a turn that is going the wrong way.
 
 ## The `/mentor` pane
 
 | What you see | What it means |
 | --- | --- |
 | **Muse is working / idle** | Whether a turn is running. The status line says the same. |
+| **sandboxed** / yellow **NOT sandboxed** | Whether Muse runs in the sandbox (see below). |
 | Yellow card, **? ANSWER NEEDED** | Muse wants to run the command shown. **Allow** or **Deny** (keys `a` / `d` act on the top card). |
 | Red card, **! RISKY** | It touches secrets, uses `sudo`, pushes, or reaches outside the repo. **Allow…** then **Confirm** (two presses), or **Deny**. |
-| Activity feed | Claude's prompts to Muse (`CLAUDE`), Muse's replies (`MUSE`), automatic answers, and every decision. |
+| Activity feed | Claude's prompts to Muse (`CLAUDE`), Muse's replies (`MUSE`), automatic answers, every decision, and commands Muse's shell moved to the background (`BG`). |
 | Changes | `git status` and the diff stat of the repo. |
 | `steer>` box | A note for the turn Muse is running now; it reads it without stopping. |
 | **Interrupt** (`i`), **Stop session** (`s`) | End the current turn, or end the Muse session. |
@@ -75,10 +80,23 @@ Muse is refused automatically if it tries the same command again, however it is 
    `sudo`, `git push`, `systemctl`, forced or recursive deletes, network devices, or a path outside
    the repo. Claude cannot override this.
 
+## The sandbox
+
+By default the bridge runs Muse under bubblewrap. Inside it, the filesystem is read-only, and
+`/home`, `/tmp`, `/run/user` (your ssh-agent, D-Bus and the bridge's own socket) and removable
+media are empty. Only the repo and Muse's own state directories (`~/.config/muse`,
+`~/.local/share/muse`) are writable, and Muse's `settings.json` and `trust.json` stay read-only so
+it cannot loosen its own policy. Your `~/.gitconfig` and `~/.local/bin` are visible read-only.
+
+The network stays open, since Muse needs it to reach its model. So Muse can still send what it
+can read (the repo, its own state, the rest of the system) somewhere. To run without the sandbox,
+for example for a task that needs files outside the repo, tell Claude to start Muse with
+`sandbox: false`. The pane then shows **NOT sandboxed**.
+
 ## Safety, honestly
 
-- **Muse runs as you.** It can read any file you can: reading outside the repo did not ask in
-  testing. The approval flow covers *commands*, not file reads.
+- **Without the sandbox, Muse runs as you.** It can read any file you can: reading outside the
+  repo did not ask in testing. The approval flow covers *commands*, not file reads.
 - The risky-command check is **a tripwire for the obvious, not a sandbox.** A determined or
   confused agent can phrase a command it doesn't catch. Use this on repos and machines where that is
   acceptable.
@@ -88,13 +106,14 @@ Muse is refused automatically if it tries the same command again, however it is 
 ## Good to know
 
 - **Long tasks:** Claude waits about 9 minutes per call, then keeps waiting on its own (you'll see
-  "still running"). Muse itself gives up on any single shell command after 300 s and ends the turn
-  without saying so, so long builds or test runs should be split into shorter steps.
+  "still running"). Muse itself moves any shell command that runs past 300 s to the background and
+  may end the turn without saying so. The bridge spots this and warns Claude, but long builds or
+  test runs are still best split into shorter steps.
 - **Muse not starting?** Claude reports the bridge's log. To read it yourself:
   `journalctl --user -u muse-bridge-mentor -n 50`.
 - **Without Claude:** the bridge has its own command line:
-  `muse-bridge.py serve -w REPO`, then `ask`, `wait`, `decide`, `steer`, `status`, `stop`
-  (`muse-bridge.py --help`).
+  `muse-bridge.py serve -w REPO [--sandbox]`, then `ask`, `wait`, `decide`, `steer`, `interrupt`,
+  `skills`, `status`, `stop` (`muse-bridge.py --help`).
 
 ## Shell-only alternative (no approvals)
 

@@ -3,6 +3,7 @@ export type Pending = { id: string; summary: string; kind: string; isJudgeUnsure
 export type Snap = {
   isUp: boolean
   workspace: string
+  isSandboxed: boolean
   isRunning: boolean
   pending: Pending[]
   feed: Line[]
